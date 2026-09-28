@@ -4,7 +4,7 @@ Binary protocol for controlling the strip over the USB Serial port (USB-CDC).
 Works without Wi-Fi.
 
 - Port settings: **115200 baud, 8N1** (baud rate is ignored by USB-CDC, but set it anyway)
-- Protocol version: **1** (returned by `PING`)
+- Protocol version: **2** (returned by `PING`, see [Changelog](#changelog))
 - All values are single bytes; multi-byte fields are sent in the order listed.
 
 ## Frame format
@@ -57,13 +57,22 @@ the checksum.
 
 | CMD    | Name    | LEN | Payload                                            |
 |--------|---------|-----|----------------------------------------------------|
-| `0x80` | `PONG`  | 1   | `version` — protocol version (`1`)                 |
+| `0x80` | `PONG`  | 5   | `version` (`2`), then the ASCII signature `LMC3`   |
 | `0x81` | `STATE` | 7   | `on`, `mode`, `r`, `g`, `b`, `brightness`, `speed` |
 | `0xEE` | `ERROR` | 1   | `code` — see [Error codes](#error-codes)           |
 
 Every valid request gets exactly one response. The `STATE` payload has the
 same layout as the `SET_ALL` payload, so a state that has been read can be
 sent back unchanged.
+
+The `LMC3` signature in `PONG` lets a host tell this board apart from any
+other ESP32 on a USB serial port — they all share the same USB VID/PID.
+
+### Unsolicited `STATE`
+
+When the state is changed by something other than the Serial host (the web
+UI), the device also sends a `STATE` frame without being asked. Hosts should
+accept `STATE` at any time, not only as a reply.
 
 ### Error codes
 
@@ -110,7 +119,7 @@ Responses:
 
 | Response                     | Bytes             |
 |------------------------------|-------------------|
-| `PONG`, version 1            | `AA 80 01 01 80`  |
+| `PONG`, version 2            | `AA 80 05 02 4C 4D 43 33 F6` |
 | `ERROR`, bad checksum        | `AA EE 01 01 EE`  |
 
 ### Checksum walkthrough
@@ -175,6 +184,13 @@ with serial.Serial("COM5", 115200, timeout=1) as port:
     elif cmd == 0xEE:
         print("error", hex(data[0]))
 ```
+
+## Changelog
+
+- **v2** — `PONG` payload grew from `version` to `version` + `LMC3`
+  signature (version stays the first byte, so v1 hosts still read it).
+  The device sends unsolicited `STATE` frames on changes from the web UI.
+- **v1** — initial version.
 
 ## Factory reset
 

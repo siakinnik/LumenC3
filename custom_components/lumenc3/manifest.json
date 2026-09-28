@@ -1,0 +1,19 @@
+{
+  "domain": "lumenc3",
+  "name": "LumenC3",
+  "codeowners": ["@siakinnik"],
+  "config_flow": true,
+  "dependencies": ["usb"],
+  "documentation": "https://github.com/siakinnik/LumenC3",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/siakinnik/LumenC3/issues",
+  "requirements": ["pyserial-asyncio-fast>=0.13"],
+  "usb": [
+    {
+      "vid": "303A",
+      "pid": "1001"
+    }
+  ],
+  "version": "0.1.0"
+}

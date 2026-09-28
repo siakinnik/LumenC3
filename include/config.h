@@ -22,7 +22,8 @@
 
 // ================== SERIAL PROTOCOL ==================
 // Binary control protocol over USB Serial, see PROTOCOL.md.
-#define PROTO_VERSION     1
+#define PROTO_VERSION     2
+#define PROTO_SIGNATURE   "LMC3"   // sent in PONG so hosts can tell this board from other ESP32s
 #define PROTO_SOF         0xAA     // start-of-frame byte (never appears in the ASCII log output)
 #define PROTO_MAX_PAYLOAD 16       // longest accepted payload, bytes
 #define PROTO_TIMEOUT_MS  100      // max gap between bytes of one frame before it's dropped

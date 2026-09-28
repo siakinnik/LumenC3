@@ -1,0 +1,33 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Connect a LumenC3",
+        "description": "Pick the serial port the LumenC3 board is plugged into. Ports already used by other integrations are not listed.",
+        "data": {
+          "port": "Serial port"
+        }
+      },
+      "confirm": {
+        "description": "A device that may be a LumenC3 was found on `{port}`. Set it up?\n\nThe port will be opened to check the device; this may reboot the board."
+      }
+    },
+    "error": {
+      "cannot_connect": "The device didn't answer. Check that the port is free (close any serial monitor) and that the board runs LumenC3 firmware with protocol v2 or newer."
+    },
+    "abort": {
+      "already_configured": "This LumenC3 is already configured.",
+      "port_in_use": "This port is already used by another integration.",
+      "not_lumenc3": "The device on this port is not a LumenC3 (or its firmware is too old).",
+      "no_ports": "No free serial ports found."
+    }
+  },
+  "entity": {
+    "number": {
+      "speed": {
+        "name": "Speed"
+      }
+    }
+  }
+}

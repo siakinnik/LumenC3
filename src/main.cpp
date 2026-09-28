@@ -155,6 +155,8 @@ String stateJson() {
   return String(b);
 }
 
+void sendState();  // Serial protocol, below
+
 void handleSet() {
   if (server.hasArg("on"))   st.on = server.arg("on").toInt() != 0;
   if (server.hasArg("mode")) {
@@ -168,6 +170,7 @@ void handleSet() {
   if (server.hasArg("brightness")) st.brightness = constrain(server.arg("brightness").toInt(), 1, 255);
   if (server.hasArg("speed"))      st.speed      = constrain(server.arg("speed").toInt(), 1, 100);
   touch();
+  sendState();  // let a Serial host (e.g. Home Assistant) see changes made from the web UI
   server.send(200, "application/json", stateJson());
 }
 
@@ -234,7 +237,12 @@ void handleCommand(uint8_t cmd, const uint8_t* p, uint8_t len) {
   if (len != need) { sendError(ERR_LENGTH); return; }
 
   switch (cmd) {
-    case CMD_PING: { uint8_t v = PROTO_VERSION; sendFrame(RSP_PONG, &v, 1); return; }
+    case CMD_PING: {
+      uint8_t v[1 + sizeof(PROTO_SIGNATURE) - 1] = { PROTO_VERSION };
+      memcpy(v + 1, PROTO_SIGNATURE, sizeof(PROTO_SIGNATURE) - 1);
+      sendFrame(RSP_PONG, v, sizeof(v));
+      return;
+    }
     case CMD_GET_STATE: break;
     case CMD_SET_POWER: st.on = p[0] != 0; touch(); break;
     case CMD_SET_MODE:
