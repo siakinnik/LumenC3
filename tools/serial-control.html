@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LumenC3 Serial</title>
+<style>
+  :root { --bg:#111; --panel:#1b1b1b; --btn:#2a2a2a; --fg:#eee; --muted:#999; --accent:#e8a33a; --err:#e05555; --ok:#5fbf6a; }
+  * { box-sizing:border-box }
+  body { font-family:system-ui,sans-serif; background:var(--bg); color:var(--fg); margin:0 auto; padding:16px; max-width:520px }
+  h1 { font-size:22px; margin:0 0 12px }
+  button { padding:12px 6px; border:0; border-radius:10px; background:var(--btn); color:var(--fg); font-size:15px; cursor:pointer }
+  button:disabled { opacity:.4; cursor:default }
+  button.on { background:var(--accent); color:#111 }
+  .row { display:flex; gap:8px; align-items:center }
+  .row > * { flex:1 }
+  .grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin:12px 0 }
+  label { display:flex; justify-content:space-between; margin-top:16px; font-size:14px; color:var(--muted) }
+  input[type=range] { width:100% }
+  input[type=color] { width:100%; height:44px; border:0; background:none; padding:0 }
+  #status { font-size:14px; color:var(--muted); margin:8px 0 }
+  #status.ok { color:var(--ok) } #status.err { color:var(--err) }
+  #controls.off { opacity:.4; pointer-events:none }
+  details { margin-top:20px; background:var(--panel); border-radius:10px; padding:10px }
+  summary { cursor:pointer; color:var(--muted); font-size:14px }
+  #log { font:12px/1.4 ui-monospace,Consolas,monospace; white-space:pre-wrap; word-break:break-all; max-height:260px; overflow:auto; margin-top:8px }
+  .tx { color:#7fb2ff } .rx { color:var(--ok) } .txt { color:var(--muted) } .e { color:var(--err) }
+</style>
+</head>
+<body>
+<h1>LumenC3 — Serial</h1>
+
+<div class="row">
+  <button id="connect">Connect</button>
+  <button id="save" disabled>Save to flash</button>
+</div>
+<div id="status">Not connected</div>
+
+<div id="controls" class="off">
+  <button id="pw" style="width:100%">Power</button>
+  <div class="grid" id="modes"></div>
+  <label>Color</label><input type="color" id="col" value="#ff3c00">
+  <label>Brightness <span id="brv"></span></label><input type="range" id="br" min="1" max="255" value="160">
+  <label>Speed <span id="spv"></span></label><input type="range" id="sp" min="1" max="100" value="50">
+</div>
+
+<details open>
+  <summary>Log</summary>
+  <div id="log"></div>
+</details>
+
+<script>
+// Protocol: see PROTOCOL.md. Frame = SOF | CMD | LEN | PAYLOAD | XOR(CMD, LEN, PAYLOAD)
+const SOF = 0xAA, TIMEOUT_MS = 100, MAX_PAYLOAD = 16;
+const CMD = { PING:0x00, GET_STATE:0x01, SET_POWER:0x02, SET_MODE:0x03, SET_COLOR:0x04,
+              SET_BRIGHTNESS:0x05, SET_SPEED:0x06, SET_ALL:0x07, SAVE:0x08 };
+const RSP = { PONG:0x80, STATE:0x81, ERROR:0xEE };
+const ERRORS = { 1:'bad checksum', 2:'unknown command', 3:'bad length', 4:'value out of range' };
+const MODES = ['Solid','Rainbow','Fire','Comet','Twinkle','Breathe','Chase'];
+
+const g = id => document.getElementById(id);
+const hex = bytes => [...bytes].map(b => b.toString(16).padStart(2,'0').toUpperCase()).join(' ');
+
+let port = null, writer = null, reader = null, state = null;
+
+// ---------- log ----------
+function log(text, cls) {
+  const el = g('log'), line = document.createElement('div');
+  line.className = cls || ''; line.textContent = text;
+  el.appendChild(line);
+  while (el.childNodes.length > 300) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+}
+function setStatus(text, cls) { g('status').textContent = text; g('status').className = cls || ''; }
+
+// ---------- sending ----------
+function frame(cmd, payload = []) {
+  let cs = cmd ^ payload.length;
+  for (const b of payload) cs ^= b;
+  return new Uint8Array([SOF, cmd, payload.length, ...payload, cs]);
+}
+async function send(cmd, payload) {
+  if (!writer) return;
+  const f = frame(cmd, payload);
+  log('→ ' + hex(f), 'tx');
+  try { await writer.write(f); } catch (e) { log('write failed: ' + e.message, 'e'); }
+}
+
+// ---------- receiving ----------
+// same state machine as the firmware; bytes outside frames are the device's text log
+const parser = { st:'SOF', cmd:0, len:0, buf:[], cs:0, last:0, text:'' };
+
+function flushText() {
+  const t = parser.text.replace(/\r/g, '');
+  const lines = t.split('\n');
+  parser.text = lines.pop();
+  for (const l of lines) if (l.trim()) {
+    log(l, 'txt');
+    if (l.includes('LED strip: starting')) setTimeout(() => send(CMD.GET_STATE), 300);  // board rebooted
+  }
+}
+
+function feed(b) {
+  const p = parser, now = performance.now();
+  if (p.st !== 'SOF' && now - p.last > TIMEOUT_MS) p.st = 'SOF';
+  p.last = now;
+  switch (p.st) {
+    case 'SOF':
+      if (b === SOF) p.st = 'CMD';
+      else { p.text += String.fromCharCode(b); if (b === 10) flushText(); }
+      break;
+    case 'CMD': p.cmd = b; p.cs = b; p.st = 'LEN'; break;
+    case 'LEN':
+      if (b > MAX_PAYLOAD) { p.st = 'SOF'; break; }
+      p.len = b; p.cs ^= b; p.buf = [];
+      p.st = b ? 'DATA' : 'CS';
+      break;
+    case 'DATA':
+      p.buf.push(b); p.cs ^= b;
+      if (p.buf.length === p.len) p.st = 'CS';
+      break;
+    case 'CS':
+      p.st = 'SOF';
+      const f = [SOF, p.cmd, p.len, ...p.buf, b];
+      if (b !== p.cs) { log('← ' + hex(f) + '  (bad checksum, ignored)', 'e'); break; }
+      log('← ' + hex(f), 'rx');
+      onFrame(p.cmd, p.buf);
+      break;
+  }
+}
+
+function onFrame(cmd, d) {
+  if (cmd === RSP.PONG) setStatus(`Connected — protocol v${d[0]}`, 'ok');
+  else if (cmd === RSP.STATE && d.length === 7) {
+    state = { on:d[0], mode:d[1], r:d[2], g:d[3], b:d[4], brightness:d[5], speed:d[6] };
+    draw();
+  } else if (cmd === RSP.ERROR) log('device error: ' + (ERRORS[d[0]] || '0x' + d[0].toString(16)), 'e');
+}
+
+async function readLoop() {
+  while (port && port.readable) {
+    reader = port.readable.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        for (const b of value) feed(b);
+      }
+    } catch (e) {
+      log('read error: ' + e.message, 'e');
+    } finally {
+      reader.releaseLock(); reader = null;
+    }
+    if (!writer) break;
+  }
+}
+
+// ---------- UI ----------
+function draw() {
+  if (!state) return;
+  g('pw').className = state.on ? 'on' : '';
+  MODES.forEach((_, i) => g('m_' + i).className = (state.on && state.mode === i) ? 'on' : '');
+  const toHex = v => v.toString(16).padStart(2, '0');
+  if (document.activeElement !== g('col')) g('col').value = '#' + toHex(state.r) + toHex(state.g) + toHex(state.b);
+  if (document.activeElement !== g('br')) g('br').value = state.brightness;
+  if (document.activeElement !== g('sp')) g('sp').value = state.speed;
+  g('brv').textContent = g('br').value; g('spv').textContent = g('sp').value;
+}
+
+function later(f) { let t; return e => { clearTimeout(t); t = setTimeout(() => f(e), 120); }; }
+
+MODES.forEach((name, i) => {
+  const b = document.createElement('button');
+  b.textContent = name; b.id = 'm_' + i;
+  b.onclick = async () => { if (state && !state.on) await send(CMD.SET_POWER, [1]); send(CMD.SET_MODE, [i]); };
+  g('modes').appendChild(b);
+});
+g('pw').onclick = () => send(CMD.SET_POWER, [state && state.on ? 0 : 1]);
+g('col').oninput = later(e => {
+  const v = parseInt(e.target.value.slice(1), 16);
+  send(CMD.SET_COLOR, [(v >> 16) & 255, (v >> 8) & 255, v & 255]);
+});
+g('br').oninput = e => { g('brv').textContent = e.target.value; setBr(e); };
+g('sp').oninput = e => { g('spv').textContent = e.target.value; setSp(e); };
+const setBr = later(e => send(CMD.SET_BRIGHTNESS, [+e.target.value]));
+const setSp = later(e => send(CMD.SET_SPEED, [+e.target.value]));
+g('save').onclick = () => send(CMD.SAVE);
+
+// ---------- connection ----------
+function setConnected(on) {
+  g('connect').textContent = on ? 'Disconnect' : 'Connect';
+  g('save').disabled = !on;
+  g('controls').className = on ? '' : 'off';
+}
+
+async function connect() {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+  } catch (e) {
+    port = null;
+    if (e.name !== 'NotFoundError') setStatus('Could not open port: ' + e.message, 'err');
+    return;
+  }
+  writer = port.writable.getWriter();
+  setConnected(true);
+  setStatus('Connected, waiting for device…');
+  readLoop();
+  await send(CMD.PING);
+  await send(CMD.GET_STATE);
+}
+
+async function disconnect() {
+  const p = port;
+  const w = writer; writer = null;
+  try { if (reader) await reader.cancel(); } catch {}
+  try { if (w) w.releaseLock(); } catch {}
+  try { if (p) await p.close(); } catch {}
+  port = null; state = null;
+  setConnected(false);
+  setStatus('Not connected');
+}
+
+g('connect').onclick = () => port ? disconnect() : connect();
+
+if (!('serial' in navigator)) {
+  g('connect').disabled = true;
+  setStatus('Web Serial is not supported in this browser. Use Chrome or Edge on desktop.', 'err');
+} else {
+  navigator.serial.addEventListener('disconnect', e => {
+    if (e.target === port) { log('device unplugged', 'e'); disconnect(); }
+  });
+}
+</script>
+</body>
+</html>
