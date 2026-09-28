@@ -87,6 +87,20 @@ come back. Settings survive the reboot.
 Changes made from the web UI show up in Home Assistant right away: the
 board pushes its state over serial.
 
+Effects are named after Yandex scenes, so the
+[Yandex Smart Home](https://github.com/dext0r/yandex_smart_home) integration
+maps them automatically, no `entity_config` needed:
+
+| Firmware mode | HA effect | Yandex scene |
+|---------------|-----------|--------------|
+| solid         | Solid     | — (pick a colour; setting a colour in Fantasy/Fire switches to Solid) |
+| rainbow       | Fantasy   | Фантазия     |
+| fire          | Fire      | Свеча        |
+| comet         | Ocean     | Океан        |
+| twinkle       | Garland   | Гирлянда     |
+| breathe       | Rest      | Отдых        |
+| chase         | Party     | Вечеринка    |
+
 Only one program can hold the port at a time: close the serial monitor
 and `tools/serial-control.html` while Home Assistant is connected.
 

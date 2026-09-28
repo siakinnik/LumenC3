@@ -20,6 +20,9 @@ from . import LumenC3ConfigEntry
 from .device import MODES, LumenC3Error
 from .entity import LumenC3Entity
 
+# modes that don't use the colour setting: rainbow and fire (see renderFrame() in src/main.cpp)
+_MODES_WITHOUT_COLOR = {MODES.index("Fantasy"), MODES.index("Fire")}
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: LumenC3ConfigEntry, async_add_entities: AddEntitiesCallback
@@ -58,7 +61,14 @@ class LumenC3Light(LumenC3Entity, LightEntity):
         s = self._device.state
         if s is None:
             raise HomeAssistantError("LumenC3 is not connected")
-        mode = MODES.index(kwargs[ATTR_EFFECT]) if kwargs.get(ATTR_EFFECT) in MODES else s.mode
+        if kwargs.get(ATTR_EFFECT) in MODES:
+            mode = MODES.index(kwargs[ATTR_EFFECT])
+        elif ATTR_RGB_COLOR in kwargs and s.mode in _MODES_WITHOUT_COLOR:
+            # picking a colour in a mode that ignores it (e.g. from a voice assistant
+            # that can't select effects) switches to a solid fill of that colour
+            mode = MODES.index("Solid")
+        else:
+            mode = s.mode
         # one SET_ALL frame, so power/colour/brightness/mode change together
         try:
             self._device.set_all(

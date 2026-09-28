@@ -48,8 +48,18 @@ ERRORS = {
     0x04: "value out of range",
 }
 
-# firmware mode order (enum Mode in include/config.h)
-MODES = ["Solid", "Rainbow", "Fire", "Comet", "Twinkle", "Breathe", "Chase"]
+# Effect names shown in Home Assistant, in firmware mode order (enum Mode in
+# include/config.h). Named after Yandex Smart Home scenes so the Yandex
+# integration maps them automatically (it matches effect names exactly):
+MODES = [
+    "Solid",    # solid    — no scene: in Yandex it's just "pick a colour"
+    "Fantasy",  # rainbow  → Фантазия
+    "Fire",     # fire     → Свеча
+    "Ocean",    # comet    → Океан
+    "Garland",  # twinkle  → Гирлянда
+    "Rest",     # breathe  → Отдых
+    "Party",    # chase    → Вечеринка
+]
 
 
 class LumenC3Error(Exception):
