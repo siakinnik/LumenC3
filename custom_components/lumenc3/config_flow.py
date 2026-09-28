@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from serial.tools import list_ports
+from serial.tools.list_ports_common import ListPortInfo
 import voluptuous as vol
 
 from homeassistant.components import usb
@@ -19,7 +20,7 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.service_info.usb import UsbServiceInfo
 
-from .const import CONF_PORT, DOMAIN
+from .const import CONF_PORT, DOMAIN, ESP_USB_PID, ESP_USB_VID
 from .device import LumenC3Error, NotLumenC3Error, async_probe
 
 
@@ -43,6 +44,21 @@ def _port_in_use(hass: HomeAssistant, paths: set[str]) -> bool:
         if paths & set(_strings(entry.data)) or paths & set(_strings(entry.options)):
             return True
     return False
+
+
+def _is_esp_native_usb(port: ListPortInfo) -> bool:
+    return (port.vid, port.pid) == (ESP_USB_VID, ESP_USB_PID)
+
+
+def _port_label(port: ListPortInfo) -> str:
+    """E.g. "/dev/ttyACM0 — ESP32 (possibly LumenC3), S/N A0:76:4E:12:34:56"."""
+    kind = "ESP32 (possibly LumenC3)" if _is_esp_native_usb(port) else (
+        port.product or port.description or f"USB {port.vid:04X}:{port.pid:04X}"
+    )
+    label = f"{port.device} — {kind}"
+    if port.serial_number:
+        label += f", S/N {port.serial_number}"
+    return label
 
 
 class LumenC3ConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -103,7 +119,13 @@ class LumenC3ConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
-        ports = await self.hass.async_add_executor_job(list_ports.comports)
+        # only USB ports: skips the dozens of legacy /dev/ttyS* Linux always creates
+        ports = [
+            p for p in await self.hass.async_add_executor_job(list_ports.comports)
+            if p.vid is not None
+        ]
+        # ESP32s with native USB (a LumenC3 is one of them) first
+        ports.sort(key=lambda p: (not _is_esp_native_usb(p), p.device))
         configured = {
             entry.data.get(CONF_PORT) for entry in self._async_current_entries(include_ignore=False)
         }
@@ -112,7 +134,7 @@ class LumenC3ConfigFlow(ConfigFlow, domain=DOMAIN):
             for p in ports
         }
         available = {
-            p.device: f"{p.device} — {p.description}" if p.description else p.device
+            p.device: _port_label(p)
             for p in ports
             if by_id[p.device] not in configured
             and not _port_in_use(self.hass, {p.device, by_id[p.device]})

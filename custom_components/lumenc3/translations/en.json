@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Connect a LumenC3",
-        "description": "Pick the serial port the LumenC3 board is plugged into. Ports already used by other integrations are not listed.",
+        "description": "Pick the serial port the LumenC3 board is plugged into. It's listed first as \"ESP32 (possibly LumenC3)\", usually /dev/ttyACM0. Only USB ports not used by other integrations are listed.",
         "data": {
           "port": "Serial port"
         }
