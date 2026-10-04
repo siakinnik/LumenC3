@@ -155,7 +155,7 @@ String stateJson() {
   return String(b);
 }
 
-void sendState();  // Serial protocol, below
+void broadcastState();  // control protocol, below
 
 void handleSet() {
   if (server.hasArg("on"))   st.on = server.arg("on").toInt() != 0;
@@ -170,7 +170,7 @@ void handleSet() {
   if (server.hasArg("brightness")) st.brightness = constrain(server.arg("brightness").toInt(), 1, 255);
   if (server.hasArg("speed"))      st.speed      = constrain(server.arg("speed").toInt(), 1, 100);
   touch();
-  sendState();  // let a Serial host (e.g. Home Assistant) see changes made from the web UI
+  broadcastState();  // let protocol hosts (e.g. Home Assistant) see changes made from the web UI
   server.send(200, "application/json", stateJson());
 }
 
@@ -195,7 +195,7 @@ void checkResetMagic(uint8_t b) {
   }
 }
 
-// ---------- Serial protocol (see PROTOCOL.md) ----------
+// ---------- control protocol over Serial and TCP (see PROTOCOL.md) ----------
 enum : uint8_t {
   CMD_PING = 0x00, CMD_GET_STATE = 0x01, CMD_SET_POWER = 0x02, CMD_SET_MODE = 0x03,
   CMD_SET_COLOR = 0x04, CMD_SET_BRIGHTNESS = 0x05, CMD_SET_SPEED = 0x06, CMD_SET_ALL = 0x07,
@@ -204,16 +204,38 @@ enum : uint8_t {
 };
 enum : uint8_t { ERR_CHECKSUM = 0x01, ERR_UNKNOWN_CMD = 0x02, ERR_LENGTH = 0x03, ERR_VALUE = 0x04 };
 
-void sendFrame(uint8_t cmd, const uint8_t* data, uint8_t len) {
+// per-connection frame parser state
+struct ProtoParser {
+  enum { WAIT_SOF, GET_CMD, GET_LEN, GET_DATA, GET_CS } stage = WAIT_SOF;
+  uint8_t cmd = 0, len = 0, pos = 0, cs = 0, buf[PROTO_MAX_PAYLOAD];
+  uint32_t lastByte = 0;
+};
+
+ProtoParser serialParser;
+WiFiServer  protoServer(PROTO_TCP_PORT);
+WiFiClient  protoClients[PROTO_MAX_CLIENTS];
+ProtoParser clientParsers[PROTO_MAX_CLIENTS];
+uint32_t    clientSince[PROTO_MAX_CLIENTS];
+bool        protoUp = false;
+
+void sendFrame(Print& out, uint8_t cmd, const uint8_t* data, uint8_t len) {
+  uint8_t f[4 + PROTO_MAX_PAYLOAD];
   uint8_t cs = cmd ^ len;
-  Serial.write(PROTO_SOF); Serial.write(cmd); Serial.write(len);
-  for (uint8_t i = 0; i < len; i++) { Serial.write(data[i]); cs ^= data[i]; }
-  Serial.write(cs);
+  f[0] = PROTO_SOF; f[1] = cmd; f[2] = len;
+  for (uint8_t i = 0; i < len; i++) { f[3 + i] = data[i]; cs ^= data[i]; }
+  f[3 + len] = cs;
+  out.write(f, 4 + len);  // one write = one TCP packet
 }
-void sendError(uint8_t code) { sendFrame(RSP_ERROR, &code, 1); }
-void sendState() {
+void sendError(Print& out, uint8_t code) { sendFrame(out, RSP_ERROR, &code, 1); }
+void sendState(Print& out) {
   uint8_t d[7] = { st.on, st.mode, st.color.r, st.color.g, st.color.b, st.brightness, st.speed };
-  sendFrame(RSP_STATE, d, sizeof(d));
+  sendFrame(out, RSP_STATE, d, sizeof(d));
+}
+
+// every host learns about every change, whoever made it
+void broadcastState() {
+  sendState(Serial);
+  for (auto& c : protoClients) if (c.connected()) sendState(c);
 }
 
 // payload length each command expects; -1 = unknown command
@@ -231,66 +253,69 @@ bool validMode(uint8_t m)       { return m < M_COUNT; }
 bool validBrightness(uint8_t v) { return v >= 1; }
 bool validSpeed(uint8_t v)      { return v >= 1 && v <= 100; }
 
-void handleCommand(uint8_t cmd, const uint8_t* p, uint8_t len) {
+// `out` is the connection the command came from: replies and errors go there,
+// state changes are broadcast to every host
+void handleCommand(uint8_t cmd, const uint8_t* p, uint8_t len, Print& out) {
   int need = payloadLen(cmd);
-  if (need < 0)    { sendError(ERR_UNKNOWN_CMD); return; }
-  if (len != need) { sendError(ERR_LENGTH); return; }
+  if (need < 0)    { sendError(out, ERR_UNKNOWN_CMD); return; }
+  if (len != need) { sendError(out, ERR_LENGTH); return; }
 
   switch (cmd) {
     case CMD_PING: {
-      uint8_t v[1 + sizeof(PROTO_SIGNATURE) - 1] = { PROTO_VERSION };
-      memcpy(v + 1, PROTO_SIGNATURE, sizeof(PROTO_SIGNATURE) - 1);
-      sendFrame(RSP_PONG, v, sizeof(v));
+      // version | "LMC3" | MAC (= USB serial number and mDNS "id": identifies the board)
+      const size_t sigLen = sizeof(PROTO_SIGNATURE) - 1;
+      uint8_t v[1 + sigLen + 6] = { PROTO_VERSION };
+      memcpy(v + 1, PROTO_SIGNATURE, sigLen);
+      WiFi.macAddress(v + 1 + sigLen);
+      sendFrame(out, RSP_PONG, v, sizeof(v));
       return;
     }
-    case CMD_GET_STATE: break;
-    case CMD_SET_POWER: st.on = p[0] != 0; touch(); break;
+    case CMD_GET_STATE: sendState(out); return;
+    case CMD_SAVE: save(); sendState(out); return;
+    case CMD_SET_POWER: st.on = p[0] != 0; break;
     case CMD_SET_MODE:
-      if (!validMode(p[0])) { sendError(ERR_VALUE); return; }
-      st.mode = p[0]; touch(); break;
-    case CMD_SET_COLOR: st.color = CRGB(p[0], p[1], p[2]); touch(); break;
+      if (!validMode(p[0])) { sendError(out, ERR_VALUE); return; }
+      st.mode = p[0]; break;
+    case CMD_SET_COLOR: st.color = CRGB(p[0], p[1], p[2]); break;
     case CMD_SET_BRIGHTNESS:
-      if (!validBrightness(p[0])) { sendError(ERR_VALUE); return; }
-      st.brightness = p[0]; touch(); break;
+      if (!validBrightness(p[0])) { sendError(out, ERR_VALUE); return; }
+      st.brightness = p[0]; break;
     case CMD_SET_SPEED:
-      if (!validSpeed(p[0])) { sendError(ERR_VALUE); return; }
-      st.speed = p[0]; touch(); break;
+      if (!validSpeed(p[0])) { sendError(out, ERR_VALUE); return; }
+      st.speed = p[0]; break;
     case CMD_SET_ALL:
       // validate everything first so a bad frame changes nothing
-      if (!validMode(p[1]) || !validBrightness(p[5]) || !validSpeed(p[6])) { sendError(ERR_VALUE); return; }
+      if (!validMode(p[1]) || !validBrightness(p[5]) || !validSpeed(p[6])) { sendError(out, ERR_VALUE); return; }
       st.on = p[0] != 0; st.mode = p[1]; st.color = CRGB(p[2], p[3], p[4]);
-      st.brightness = p[5]; st.speed = p[6]; touch(); break;
-    case CMD_SAVE: save(); break;
+      st.brightness = p[5]; st.speed = p[6]; break;
   }
-  sendState();
+  touch();
+  broadcastState();  // also the reply to the sender
 }
 
 // byte-by-byte frame parser: SOF | CMD | LEN | PAYLOAD[LEN] | XOR(CMD, LEN, PAYLOAD)
-void feedProtocol(uint8_t b) {
-  static enum { WAIT_SOF, GET_CMD, GET_LEN, GET_DATA, GET_CS } ps = WAIT_SOF;
-  static uint8_t cmd, len, pos, cs, buf[PROTO_MAX_PAYLOAD];
-  static uint32_t lastByte = 0;
-
+void feedProtocol(ProtoParser& ps, uint8_t b, Print& out) {
   // drop a half-received frame if the sender went quiet
-  if (ps != WAIT_SOF && millis() - lastByte > PROTO_TIMEOUT_MS) ps = WAIT_SOF;
-  lastByte = millis();
+  if (ps.stage != ProtoParser::WAIT_SOF && millis() - ps.lastByte > PROTO_TIMEOUT_MS)
+    ps.stage = ProtoParser::WAIT_SOF;
+  ps.lastByte = millis();
 
-  switch (ps) {
-    case WAIT_SOF: if (b == PROTO_SOF) ps = GET_CMD; break;
-    case GET_CMD:  cmd = b; cs = b; ps = GET_LEN; break;
-    case GET_LEN:
-      if (b > PROTO_MAX_PAYLOAD) { sendError(ERR_LENGTH); ps = WAIT_SOF; break; }
-      len = b; cs ^= b; pos = 0;
-      ps = len ? GET_DATA : GET_CS;
+  switch (ps.stage) {
+    case ProtoParser::WAIT_SOF: if (b == PROTO_SOF) ps.stage = ProtoParser::GET_CMD; break;
+    case ProtoParser::GET_CMD:  ps.cmd = b; ps.cs = b; ps.stage = ProtoParser::GET_LEN; break;
+    case ProtoParser::GET_LEN:
+      if (b > PROTO_MAX_PAYLOAD) { sendError(out, ERR_LENGTH); ps.stage = ProtoParser::WAIT_SOF; break; }
+      ps.len = b; ps.cs ^= b; ps.pos = 0;
+      ps.stage = ps.len ? ProtoParser::GET_DATA : ProtoParser::GET_CS;
       break;
-    case GET_DATA:
-      buf[pos++] = b; cs ^= b;
-      if (pos == len) ps = GET_CS;
+    case ProtoParser::GET_DATA:
+      ps.buf[ps.pos++] = b; ps.cs ^= b;
+      if (ps.pos == ps.len) ps.stage = ProtoParser::GET_CS;
       break;
-    case GET_CS:
-      ps = WAIT_SOF;
-      if (b != cs) sendError(ERR_CHECKSUM);
-      else handleCommand(cmd, buf, len);
+    case ProtoParser::GET_CS:
+      ps.stage = ProtoParser::WAIT_SOF;
+      if (b != ps.cs) sendError(out, ERR_CHECKSUM);
+      else handleCommand(ps.cmd, ps.buf, ps.len, out);
       break;
   }
 }
@@ -298,8 +323,33 @@ void feedProtocol(uint8_t b) {
 void pollSerial() {
   while (Serial.available()) {
     uint8_t b = Serial.read();
-    checkResetMagic(b);
-    feedProtocol(b);
+    checkResetMagic(b);  // factory reset is Serial-only: never from the network
+    feedProtocol(serialParser, b, Serial);
+  }
+}
+
+void pollTcp() {
+  if (!protoUp) return;
+
+  // accept a new host; when all slots are busy, drop the oldest
+  // (e.g. a host that vanished without closing its connection)
+  WiFiClient incoming = protoServer.available();
+  if (incoming) {
+    int slot = 0;
+    for (int i = 0; i < PROTO_MAX_CLIENTS; i++) {
+      if (!protoClients[i].connected()) { slot = i; break; }
+      if (clientSince[i] < clientSince[slot]) slot = i;
+    }
+    protoClients[slot].stop();
+    protoClients[slot] = incoming;
+    protoClients[slot].setNoDelay(true);
+    clientParsers[slot] = ProtoParser();
+    clientSince[slot] = millis();
+  }
+
+  for (int i = 0; i < PROTO_MAX_CLIENTS; i++) {
+    WiFiClient& c = protoClients[i];
+    while (c.connected() && c.available()) feedProtocol(clientParsers[i], (uint8_t)c.read(), c);
   }
 }
 
@@ -329,15 +379,24 @@ void loop() {
   static uint32_t lastFrame = 0;
 
   pollSerial();
+  pollTcp();
   wm.process();
   if (webUp) server.handleClient();
 
-  // start the web panel and mDNS once Wi-Fi is actually connected
+  // start the web panel, protocol server and mDNS once Wi-Fi is actually connected
   // (not while the portal is up — it owns port 80)
   if (WiFi.status() == WL_CONNECTED && !wm.getConfigPortalActive()) {
     if (!webUp) { setupWeb(); webUp = true; }
+    if (!protoUp) { protoServer.begin(); protoServer.setNoDelay(true); protoUp = true; }
     if (!mdnsUp) {
-      if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
+      if (MDNS.begin(HOSTNAME)) {
+        MDNS.addService("http", "tcp", 80);
+        // _lumenc3._tcp lets Home Assistant discover the board (zeroconf);
+        // "id" is the MAC, the same as the USB serial number, so HA knows it's one board
+        MDNS.addService("lumenc3", "tcp", PROTO_TCP_PORT);
+        MDNS.addServiceTxt("lumenc3", "tcp", "id", WiFi.macAddress().c_str());
+        MDNS.addServiceTxt("lumenc3", "tcp", "proto", String(PROTO_VERSION).c_str());
+      }
       Serial.print("Wi-Fi OK: "); Serial.println(WiFi.localIP());
       mdnsUp = true;
     }

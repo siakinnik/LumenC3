@@ -9,7 +9,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
-from .const import CONF_PORT, DOMAIN, SETUP_TIMEOUT
+from .const import CONF_HOST, CONF_PORT, CONF_TCP_PORT, DOMAIN, SETUP_TIMEOUT
 from .device import LumenC3Device
 
 PLATFORMS = [Platform.LIGHT, Platform.NUMBER]
@@ -18,7 +18,10 @@ type LumenC3ConfigEntry = ConfigEntry[LumenC3Device]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: LumenC3ConfigEntry) -> bool:
-    device = LumenC3Device(entry.data[CONF_PORT])
+    if CONF_HOST in entry.data:
+        device = LumenC3Device(host=entry.data[CONF_HOST], tcp_port=entry.data[CONF_TCP_PORT])
+    else:
+        device = LumenC3Device(serial_port=entry.data[CONF_PORT])
 
     first_state = asyncio.Event()
 
@@ -27,12 +30,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: LumenC3ConfigEntry) -> b
             first_state.set()
 
     remove_listener = device.add_listener(_on_update)
-    task = entry.async_create_background_task(hass, device.run(), f"{DOMAIN} {device.port}")
+    task = entry.async_create_background_task(hass, device.run(), f"{DOMAIN} {device.address}")
     try:
         await asyncio.wait_for(first_state.wait(), SETUP_TIMEOUT)
     except TimeoutError as err:
         task.cancel()
-        raise ConfigEntryNotReady(f"No answer from LumenC3 on {device.port}") from err
+        raise ConfigEntryNotReady(f"No answer from LumenC3 on {device.address}") from err
     finally:
         remove_listener()
 

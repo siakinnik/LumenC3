@@ -4,22 +4,38 @@
     "step": {
       "user": {
         "title": "Connect a LumenC3",
+        "menu_options": {
+          "serial": "USB (serial port)",
+          "network": "Wi-Fi (IP address)"
+        }
+      },
+      "serial": {
+        "title": "Connect over USB",
         "description": "Pick the serial port the LumenC3 board is plugged into. It's listed first as \"ESP32 (possibly LumenC3)\", usually /dev/ttyACM0. Only USB ports not used by other integrations are listed.",
         "data": {
           "port": "Serial port"
         }
       },
+      "network": {
+        "title": "Connect over Wi-Fi",
+        "description": "Boards on the same network are usually found automatically. Enter the address only if yours wasn't — it's printed in the board's log as \"Wi-Fi OK: …\".",
+        "data": {
+          "host": "IP address or hostname",
+          "tcp_port": "Port"
+        }
+      },
       "confirm": {
-        "description": "A device that may be a LumenC3 was found on `{port}`. Set it up?\n\nThe port will be opened to check the device; this may reboot the board."
+        "description": "Set up the LumenC3 at `{address}`?\n\nOver USB, the port is opened to check the device; this may reboot the board."
       }
     },
     "error": {
-      "cannot_connect": "The device didn't answer. Check that the port is free (close any serial monitor) and that the board runs LumenC3 firmware with protocol v2 or newer."
+      "cannot_connect": "The device didn't answer. Over USB: check that the port is free (close any serial monitor). Over Wi-Fi: check the address and that the board is online. The board must run LumenC3 firmware with protocol v3 or newer for Wi-Fi (v2 for USB).",
+      "not_lumenc3": "The device at this address is not a LumenC3 (or its firmware is too old)."
     },
     "abort": {
       "already_configured": "This LumenC3 is already configured.",
       "port_in_use": "This port is already used by another integration.",
-      "not_lumenc3": "The device on this port is not a LumenC3 (or its firmware is too old).",
+      "not_lumenc3": "The device at this address is not a LumenC3 (or its firmware is too old).",
       "no_ports": "No free serial ports found."
     }
   },

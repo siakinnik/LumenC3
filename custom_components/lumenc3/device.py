@@ -1,4 +1,4 @@
-"""Serial link to a LumenC3 LED controller.
+"""Link to a LumenC3 LED controller over USB serial or TCP (Wi-Fi).
 
 Implements the binary protocol described in PROTOCOL.md. Kept free of
 Home Assistant imports so it can be reused and tested on its own.
@@ -22,9 +22,13 @@ MAX_PAYLOAD = 16
 FRAME_TIMEOUT = 0.1  # s between bytes of one frame
 SIGNATURE = b"LMC3"
 MIN_PROTOCOL_VERSION = 2
+DEFAULT_TCP_PORT = 7531
 
 PING_INTERVAL = 0.5  # s between PINGs during the handshake
 PING_ATTEMPTS = 12  # opening the port may reboot the board, so give it time to boot
+KEEPALIVE_INTERVAL = 30.0  # s; a powered-off board never closes its TCP connection
+KEEPALIVE_TIMEOUT = 5.0
+CONNECT_TIMEOUT = 10.0  # s for a TCP connect
 RECONNECT_MIN = 1.0
 RECONNECT_MAX = 30.0
 
@@ -144,18 +148,34 @@ class FrameParser:
 
 
 class LumenC3Device:
-    """One LumenC3 board on a serial port."""
+    """One LumenC3 board, on a serial port or reachable over TCP."""
 
-    def __init__(self, port: str) -> None:
-        self.port = port
+    def __init__(
+        self,
+        *,
+        serial_port: str | None = None,
+        host: str | None = None,
+        tcp_port: int = DEFAULT_TCP_PORT,
+    ) -> None:
+        if (serial_port is None) == (host is None):
+            raise ValueError("Pass either serial_port or host")
+        self.serial_port = serial_port
+        self.host = host
+        self.tcp_port = tcp_port
         self.state: LumenC3State | None = None
         self.version: int | None = None
+        self.device_id: str | None = None  # MAC, e.g. "8C:D0:B2:A8:62:B2" (protocol v3+)
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._parser = FrameParser()
         self._pong: asyncio.Future[bytes] | None = None
         self._listeners: list[Callable[[], None]] = []
         self._was_connected = False
+
+    @property
+    def address(self) -> str:
+        """Human-readable location, for logs and messages."""
+        return self.serial_port or f"{self.host}:{self.tcp_port}"
 
     @property
     def connected(self) -> bool:
@@ -172,11 +192,18 @@ class LumenC3Device:
 
     # ---------- connection ----------
 
-    async def open_and_handshake(self) -> None:
-        """Open the port and confirm a LumenC3 is on the other end."""
-        reader, self._writer = await serial_asyncio_fast.open_serial_connection(
-            url=self.port, baudrate=BAUDRATE
+    async def _open(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if self.host is not None:
+            return await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.tcp_port), CONNECT_TIMEOUT
+            )
+        return await serial_asyncio_fast.open_serial_connection(
+            url=self.serial_port, baudrate=BAUDRATE
         )
+
+    async def open_and_handshake(self) -> None:
+        """Connect and confirm a LumenC3 is on the other end."""
+        reader, self._writer = await self._open()
         self._parser = FrameParser()
         self._reader_task = asyncio.create_task(self._read_loop(reader))
         loop = asyncio.get_running_loop()
@@ -191,12 +218,14 @@ class LumenC3Device:
             )
             if self._reader_task in done:
                 self._reader_task.result()  # re-raises the read error
-                raise LumenC3Error("Serial port closed during handshake")
+                raise LumenC3Error("Connection closed during handshake")
             if self._pong in done:
                 payload = self._pong.result()
                 if payload[1:5] != SIGNATURE or payload[0] < MIN_PROTOCOL_VERSION:
                     raise NotLumenC3Error(f"Unexpected PONG: {payload.hex(' ')}")
                 self.version = payload[0]
+                if len(payload) >= 11:  # v3+: MAC, formatted like the USB serial number
+                    self.device_id = ":".join(f"{b:02X}" for b in payload[5:11])
                 return
         raise LumenC3Error("No answer to PING")
 
@@ -222,31 +251,57 @@ class LumenC3Device:
             while True:
                 try:
                     await self.open_and_handshake()
-                    _LOGGER.info("Connected to LumenC3 on %s (protocol v%s)", self.port, self.version)
+                    _LOGGER.info("Connected to LumenC3 on %s (protocol v%s)", self.address, self.version)
                     self._was_connected = True
                     delay = RECONNECT_MIN
                     self._send(CMD_GET_STATE)
                     self._notify()
-                    assert self._reader_task is not None
-                    await self._reader_task  # only ends by raising when the port dies
+                    await self._wait_until_lost()
                 except (OSError, TimeoutError, LumenC3Error) as err:
                     if self._was_connected:
-                        _LOGGER.warning("Lost LumenC3 on %s: %s", self.port, err)
+                        _LOGGER.warning("Lost LumenC3 on %s: %s", self.address, err)
                         self._was_connected = False
                     else:
-                        _LOGGER.debug("Can't connect to LumenC3 on %s: %s", self.port, err)
+                        _LOGGER.debug("Can't connect to LumenC3 on %s: %s", self.address, err)
                 await self.disconnect()
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, RECONNECT_MAX)
         finally:
             await self.disconnect()
 
+    async def _wait_until_lost(self) -> None:
+        """Return (by raising) once the connection dies or stops answering PINGs."""
+        assert self._reader_task is not None
+        keepalive = asyncio.create_task(self._keepalive())
+        try:
+            done, _ = await asyncio.wait(
+                {self._reader_task, keepalive}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                task.result()  # raises the reason
+            raise LumenC3Error("Connection ended")
+        finally:
+            keepalive.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await keepalive
+
+    async def _keepalive(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            self._pong = loop.create_future()
+            self._send(CMD_PING)
+            try:
+                await asyncio.wait_for(self._pong, KEEPALIVE_TIMEOUT)
+            except TimeoutError as err:
+                raise LumenC3Error("No answer to keepalive PING") from err
+
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:
         loop = asyncio.get_running_loop()
         while True:
             data = await reader.read(256)
             if not data:
-                raise LumenC3Error("Serial port closed")
+                raise LumenC3Error("Connection closed")
             for cmd, payload in self._parser.feed(data, loop.time()):
                 self._handle_frame(cmd, payload)
 
@@ -283,9 +338,8 @@ class LumenC3Device:
         )
 
 
-async def async_probe(port: str) -> int:
-    """Check that a LumenC3 is on `port` and return its protocol version."""
-    device = LumenC3Device(port)
+async def async_probe(device: LumenC3Device) -> int:
+    """Check that a LumenC3 answers at `device`'s address and return its protocol version."""
     try:
         await device.open_and_handshake()
         assert device.version is not None

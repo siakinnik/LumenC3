@@ -1,10 +1,14 @@
-# LumenC3 Serial Protocol
+# LumenC3 Control Protocol
 
-Binary protocol for controlling the strip over the USB Serial port (USB-CDC).
-Works without Wi-Fi.
+Binary protocol for controlling the strip. The same frames work over two
+transports:
 
-- Port settings: **115200 baud, 8N1** (baud rate is ignored by USB-CDC, but set it anyway)
-- Protocol version: **2** (returned by `PING`, see [Changelog](#changelog))
+- **USB Serial** (USB-CDC): **115200 baud, 8N1** (baud rate is ignored by
+  USB-CDC, but set it anyway). Works without Wi-Fi.
+- **TCP** over Wi-Fi: port **7531** (`PROTO_TCP_PORT` in `include/config.h`),
+  up to 3 hosts at once. See [TCP and discovery](#tcp-and-discovery).
+
+- Protocol version: **3** (returned by `PING`, see [Changelog](#changelog))
 - All values are single bytes; multi-byte fields are sent in the order listed.
 
 ## Frame format
@@ -25,13 +29,37 @@ A frame must be sent in one go: if more than **100 ms** pass between two
 bytes of the same frame, the partial frame is dropped and the parser waits
 for the next `0xAA`.
 
-### Text output on the same port
+### Text output on the Serial port
 
-The firmware also prints human-readable ASCII log lines to the same port
+On Serial, the firmware also prints human-readable ASCII log lines
 (`LED strip: starting`, `Wi-Fi OK: …`, WiFiManager debug output, etc.).
 All of it is below `0x80`, so `0xAA` never appears there. A host should
 skip every byte until it sees `0xAA`, then read a full frame and verify
-the checksum.
+the checksum. TCP carries frames only.
+
+## TCP and discovery
+
+Once the board is on Wi-Fi it listens on TCP port 7531 and advertises
+itself over mDNS:
+
+| mDNS field     | Value                                             |
+|----------------|---------------------------------------------------|
+| Service        | `_lumenc3._tcp.local.`                            |
+| Port           | `7531`                                            |
+| TXT `id`       | MAC, e.g. `8C:D0:B2:A8:62:B2`                     |
+| TXT `proto`    | Protocol version, e.g. `3`                        |
+
+The MAC is also the board's USB serial number and is sent in `PONG`, so a
+host can tell that a board found over USB and over Wi-Fi is the same one.
+
+- Up to **3** TCP hosts at once. When a 4th connects, the oldest connection
+  is dropped (it's usually a host that vanished without closing it).
+- The board never closes an idle connection. A host should send `PING`
+  periodically and reconnect if `PONG` doesn't come back: if the board loses
+  power, the TCP connection just goes silent.
+- There is no authentication, the same as the web UI: keep the board on a
+  trusted network.
+- The [factory reset](#factory-reset) sequence works on Serial only, never over TCP.
 
 ## Commands (host → device)
 
@@ -57,7 +85,7 @@ the checksum.
 
 | CMD    | Name    | LEN | Payload                                            |
 |--------|---------|-----|----------------------------------------------------|
-| `0x80` | `PONG`  | 5   | `version` (`2`), then the ASCII signature `LMC3`   |
+| `0x80` | `PONG`  | 11  | `version` (`3`), ASCII signature `LMC3`, 6-byte MAC |
 | `0x81` | `STATE` | 7   | `on`, `mode`, `r`, `g`, `b`, `brightness`, `speed` |
 | `0xEE` | `ERROR` | 1   | `code` — see [Error codes](#error-codes)           |
 
@@ -67,12 +95,16 @@ sent back unchanged.
 
 The `LMC3` signature in `PONG` lets a host tell this board apart from any
 other ESP32 on a USB serial port — they all share the same USB VID/PID.
+The MAC identifies the board (see [TCP and discovery](#tcp-and-discovery)).
+Hosts should accept a longer `PONG` than they know: future versions may
+append fields.
 
-### Unsolicited `STATE`
+### Broadcast `STATE`
 
-When the state is changed by something other than the Serial host (the web
-UI), the device also sends a `STATE` frame without being asked. Hosts should
-accept `STATE` at any time, not only as a reply.
+Every state change is sent as a `STATE` frame to **every** connected host:
+the Serial host and all TCP hosts, whoever made the change (a Serial or TCP
+host, or the web UI). For the host that sent the command, this is also its
+reply. Hosts should accept `STATE` at any time, not only as a reply.
 
 ### Error codes
 
@@ -119,7 +151,7 @@ Responses:
 
 | Response                     | Bytes             |
 |------------------------------|-------------------|
-| `PONG`, version 2            | `AA 80 05 02 4C 4D 43 33 F6` |
+| `PONG`, v3, MAC `8C:D0:B2:A8:62:B2` | `AA 80 0B 03 4C 4D 43 33 8C D0 B2 A8 62 B2 6F` |
 | `ERROR`, bad checksum        | `AA EE 01 01 EE`  |
 
 ### Checksum walkthrough
@@ -187,6 +219,9 @@ with serial.Serial("COM5", 115200, timeout=1) as port:
 
 ## Changelog
 
+- **v3** — TCP transport on port 7531 with mDNS discovery (`_lumenc3._tcp`).
+  `PONG` gained the board's MAC after the signature. State changes are
+  broadcast to all hosts, whoever made them.
 - **v2** — `PONG` payload grew from `version` to `version` + `LMC3`
   signature (version stays the first byte, so v1 hosts still read it).
   The device sends unsolicited `STATE` frames on changes from the web UI.

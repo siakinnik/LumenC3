@@ -20,9 +20,11 @@
 #define RESET_MAGIC     { 0x5A, 0xA5, 0xC3, 0x3C, 0xDE, 0xAD }
 #define RESET_MAGIC_LEN 6
 
-// ================== SERIAL PROTOCOL ==================
-// Binary control protocol over USB Serial, see PROTOCOL.md.
-#define PROTO_VERSION     2
+// ================== CONTROL PROTOCOL ==================
+// Binary control protocol over USB Serial and TCP (Wi-Fi), see PROTOCOL.md.
+#define PROTO_VERSION     3
+#define PROTO_TCP_PORT    7531     // TCP port of the protocol server (advertised via mDNS)
+#define PROTO_MAX_CLIENTS 3        // simultaneous TCP hosts
 #define PROTO_SIGNATURE   "LMC3"   // sent in PONG so hosts can tell this board from other ESP32s
 #define PROTO_SOF         0xAA     // start-of-frame byte (never appears in the ASCII log output)
 #define PROTO_MAX_PAYLOAD 16       // longest accepted payload, bytes

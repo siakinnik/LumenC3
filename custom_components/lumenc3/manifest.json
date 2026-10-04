@@ -15,5 +15,6 @@
       "pid": "1001"
     }
   ],
-  "version": "0.1.0"
+  "version": "0.2.0",
+  "zeroconf": ["_lumenc3._tcp.local."]
 }

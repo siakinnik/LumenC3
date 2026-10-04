@@ -12,8 +12,8 @@ Firmware for driving a WS2812B / SK6812 addressable LED strip from an ESP32-C3 S
   brightness and speed; works without Wi-Fi. See [PROTOCOL.md](PROTOCOL.md).
   A ready-made control panel is in [tools/serial-control.html](tools/serial-control.html) —
   open it in Chrome or Edge, click **Connect** and pick the board's port.
-- **Home Assistant integration** (HACS) over USB serial, with auto-discovery —
-  see [below](#home-assistant).
+- **Home Assistant integration** (HACS) over USB serial or Wi-Fi, with
+  auto-discovery for both — see [below](#home-assistant).
 - **Captive-portal Wi-Fi setup** *(not tested)* — on first boot the board
   hosts a `LED-Strip-Setup` access point; connect, pick your network, done.
   No credentials hard-coded in the source. The portal is non-blocking: the
@@ -43,9 +43,13 @@ pio device monitor
 
 ## Home Assistant
 
-Plug the board into the machine running Home Assistant over USB. The
-integration talks to it with the [serial protocol](PROTOCOL.md) and needs
-firmware with protocol **v2** or newer. No Wi-Fi is needed.
+The integration talks to the board with the [control protocol](PROTOCOL.md),
+either way:
+
+- **USB** — plug the board into the machine running Home Assistant. No
+  Wi-Fi needed. Firmware with protocol **v2** or newer.
+- **Wi-Fi** — the board just has to be on the same network. Firmware with
+  protocol **v3** or newer.
 
 ### Install with HACS
 
@@ -58,10 +62,21 @@ Manual install: copy `custom_components/lumenc3` into your
 
 ### Setup
 
-- **Auto-discovery** — when the board is plugged in, Home Assistant shows
+- **Auto-discovery** — when the board is plugged in over USB or appears on
+  the network (mDNS `_lumenc3._tcp`), Home Assistant shows
   *Discovered: LumenC3*. Press **Add** to confirm.
 - **Manually** — Settings → Devices & services → Add integration → LumenC3,
-  then pick the port.
+  then choose **USB** and pick the port, or **Wi-Fi** and enter the IP
+  (printed in the board's log as `Wi-Fi OK: …`).
+
+The board is identified by its MAC, so if it's found both over USB and over
+Wi-Fi it's still one device: once it's set up one way, discovery the other
+way is skipped. If its IP changes, the Wi-Fi entry follows it automatically.
+
+Over Wi-Fi the integration pings the board every 30 s, so a board that lost
+power shows up as unavailable instead of silently stale.
+
+### USB discovery and other ESP32 devices
 
 Every ESP32-C3 with native USB reports the same USB ID (`303A:1001`), so
 discovery can't tell a LumenC3 from other ESP32 devices by USB alone. To
@@ -84,8 +99,8 @@ come back. Settings survive the reboot.
 | `light.lumenc3`  | Power, brightness, RGB colour; animation modes as effects  |
 | `number.lumenc3_speed` | Animation speed, 1–100                               |
 
-Changes made from the web UI show up in Home Assistant right away: the
-board pushes its state over serial.
+Changes made elsewhere (web UI, another USB or Wi-Fi host) show up in Home
+Assistant right away: the board pushes its state to every connected host.
 
 Effects are named after Yandex scenes, so the
 [Yandex Smart Home](https://github.com/dext0r/yandex_smart_home) integration
@@ -101,8 +116,22 @@ maps them automatically, no `entity_config` needed:
 | breathe       | Rest      | Отдых        |
 | chase         | Party     | Вечеринка    |
 
-Only one program can hold the port at a time: close the serial monitor
-and `tools/serial-control.html` while Home Assistant is connected.
+Over USB, only one program can hold the port at a time: close the serial
+monitor and `tools/serial-control.html` while Home Assistant is connected.
+Over Wi-Fi, up to 3 hosts can be connected at once.
 
-If Home Assistant runs in Docker, pass the device through, for example
-`--device /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_…`.
+### Docker
+
+For USB, mount `/dev` and `/run/udev` so devices survive replugging and USB
+discovery works. Passing a single `--device /dev/ttyACM0` only gives the
+container a snapshot taken at startup:
+
+```yaml
+    privileged: true            # or device_cgroup_rules: ['c 166:* rmw']
+    volumes:
+      - /dev:/dev
+      - /run/udev:/run/udev:ro
+```
+
+For Wi-Fi discovery the container needs to see mDNS, e.g. with
+`network_mode: host`.
