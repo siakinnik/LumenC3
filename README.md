@@ -135,3 +135,9 @@ python smartctl.py serial:COM5 set light.color=#00ff40 light.effect=solid
 python smartctl.py tcp:lumenc3-62b2.local watch          # print changes as they happen
 python smartctl.py serial:COM5 trigger sys.reboot
 ```
+
+## Contributing
+
+Pull requests are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md). Before
+the first one is merged, its author signs the [CLA](CLA.md) with one comment
+in the pull request.
