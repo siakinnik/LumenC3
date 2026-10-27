@@ -1,0 +1,3 @@
+[submodule "components/smart-core"]
+	path = components/smart-core
+	url = https://github.com/siakinnik/smart-core

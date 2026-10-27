@@ -1,0 +1,22 @@
+LumenC3
+Copyright (c) 2026 siakinnik
+Licensed under the GNU General Public License v3.0 or later (see LICENSE).
+
+The firmware is built from:
+
+smart-core (components/smart-core)   GPL-3.0-or-later
+    https://github.com/siakinnik/smart-core
+    includes Monocypher 4.0.3, BSD-2-Clause OR CC0-1.0 (used under CC0-1.0)
+
+ESP-IDF v6.1                          Apache-2.0
+    https://github.com/espressif/esp-idf
+    Some ESP-IDF libraries (Wi-Fi, Bluetooth controller, PHY) are provided
+    by Espressif as binaries only, under Espressif's terms; they are system
+    libraries of the platform, not part of this work.
+
+espressif/led_strip                   Apache-2.0  (IDF component manager)
+espressif/mdns                        Apache-2.0  (IDF component manager)
+    The exact versions used are pinned in dependencies.lock.
+
+Corresponding source for a firmware binary: this repository at the
+commit it was built from, with its submodule and dependencies.lock.
