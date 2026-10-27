@@ -12,6 +12,7 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "nvs.h"
+#include "ota_key.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -38,6 +39,10 @@ static volatile uint32_t show_since;
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 static bool ble_up;  // the BLE stack is only brought up for a pairing window
+
+#ifdef OTA_SIGNING_KEY
+static const uint8_t ota_key[32] = OTA_SIGNING_KEY;
+#endif
 
 // Called by the core (with its lock held) on pairing window events.
 static void on_pairing(smart_core_t *core, smart_pairing_event_t ev, void *user)
@@ -204,6 +209,10 @@ void app_main(void)
         .firmware = esp_app_get_description()->version,
         .on_change = on_change,
         .on_pairing = on_pairing,
+#ifdef OTA_SIGNING_KEY
+        .ota_key = ota_key,
+#endif
+        .security_version = DEVICE_SECURITY_VERSION,
     };
     smart_init(&g_smart, &cfg);
     register_props();
@@ -248,8 +257,13 @@ void app_main(void)
     }
     bool cycles_forgotten = cycles == 0;
 
-    // we got this far: keep this firmware if it came as an OTA update
-    esp_ota_mark_app_valid_cancel_rollback();
+    // A firmware fresh from an update is on trial: if it crashes or hangs
+    // before UPDATE_TRIAL_MS, the bootloader goes back to the previous one.
+    esp_ota_img_states_t ota_state = ESP_OTA_IMG_VALID;
+    esp_ota_get_state_partition(esp_ota_get_running_partition(), &ota_state);
+    bool on_trial = ota_state == ESP_OTA_IMG_PENDING_VERIFY;
+    if (on_trial)
+        ESP_LOGW(TAG, "new firmware on trial for %d s", UPDATE_TRIAL_MS / 1000);
 
     static smart_rgb_t frame[LED_COUNT], overlay[LED_COUNT], out[LED_COUNT];
     TickType_t wake = xTaskGetTickCount();
@@ -257,7 +271,14 @@ void app_main(void)
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(FRAME_MS));
         if (pending != RUN)
             restart(pending == RESET);
+        if (smart_esp_update_ready())
+            restart(false);
         uint32_t now = now_ms();
+        if (on_trial && now >= UPDATE_TRIAL_MS) {
+            esp_ota_mark_app_valid_cancel_rollback();
+            ESP_LOGI(TAG, "new firmware kept");
+            on_trial = false;
+        }
         if (!cycles_forgotten && now >= POWER_CYCLE_MS) {
             forget_power_cycles();  // stayed on long enough: the next power-on starts from 1
             cycles_forgotten = true;

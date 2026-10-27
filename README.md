@@ -7,8 +7,8 @@ by all siakinnik-home devices.
 
 > **Work in progress.** Version 2 is a rewrite (Arduino → ESP-IDF, own
 > protocol → smart-core), tested on an ESP32-C3 SuperMini over USB, Wi-Fi
-> and BLE. Not done yet: signed OTA updates, the Home Assistant integration
-> (siakinnik-home). Version 1 (Arduino, protocol v3, the old Home Assistant
+> and BLE, including signed OTA updates. Not done yet: the Home Assistant
+> integration (siakinnik-home). Version 1 (Arduino, protocol v3, the old Home Assistant
 > integration) is in the git history.
 
 ## Features
@@ -25,7 +25,8 @@ by all siakinnik-home devices.
 - **7 effects** — solid, rainbow, fire, comet, twinkle, breathe, chase.
 - **PSU current limit** — brightness is scaled to stay under `LED_MAX_MILLIAMPS`.
 - **Settings survive reboots** (NVS), saved 3 s after the last change.
-- **Two OTA slots** in the partition table, ready for over-the-air updates.
+- **Signed over-the-air updates** over Wi-Fi, BLE or USB, with automatic
+  rollback if a new firmware fails within its first minute.
 
 ## Properties
 
@@ -68,6 +69,39 @@ idf.py build flash monitor
 
 `led_strip` and `mdns` are fetched by the IDF component manager on the
 first build.
+
+To work on smart-core and the firmware together, build against your
+checkout of the core instead of the submodule:
+
+```bash
+SMART_CORE_DIR=../smart-core idf.py build
+```
+
+## Updates
+
+Releases are signed: a strip only installs firmware signed with the key
+its own firmware was built with. The public key is `ota_signing.pub` in the
+repository; the private key stays with the maintainer. Build without
+`ota_signing.pub` (or with your own, see below) and the strip takes only
+your updates.
+
+```bash
+python smartctl.py tcp:192.168.0.184 update lumenc3-2.1.0.simg
+```
+
+A new firmware is on trial for its first 60 seconds: if it crashes, hangs
+or is switched off in that time, the strip goes back to the previous one.
+
+**Your own builds:**
+
+```bash
+python smartsign.py keygen ~/.config/smart-core/lumenc3.key         # once
+LUMENC3_OTA_KEY=~/.config/smart-core/lumenc3.pub idf.py build       # or put it in ota_signing.pub
+python smartsign.py sign build/lumenc3.bin --key ~/.config/smart-core/lumenc3.key --model-id 0x0001
+```
+
+Flash the first build over USB; after that it updates over the air with
+images signed by your key.
 
 ## Connect to Wi-Fi
 

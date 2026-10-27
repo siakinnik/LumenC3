@@ -13,6 +13,7 @@
 #include "driver/usb_serial_jtag_vfs.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_ota_ops.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -27,16 +28,27 @@ static const char *TAG = "smart";
 
 smart_core_t g_smart;
 
-static SemaphoreHandle_t core_lock;  // recursive: guards g_smart and links[]
-static SemaphoreHandle_t usb_tx_lock;  // one writer at a time on USB: packets and log lines
+static SemaphoreHandle_t core_lock;   // recursive: guards g_smart and links[]
+static SemaphoreHandle_t usb_tx_lock; // one writer at a time on USB: packets and log lines
 static nvs_handle_t nvs;
-static bool rf_on;  // Wi-Fi running: esp_fill_random() is a true RNG
+static bool rf_on; // Wi-Fi running: esp_fill_random() is a true RNG
 
-typedef enum { LINK_NONE, LINK_USB, LINK_TCP, LINK_EXT } link_t;
-static struct {
+static esp_ota_handle_t ota_handle;
+static const esp_partition_t *ota_part;
+static volatile bool update_ready;
+
+typedef enum
+{
+    LINK_NONE,
+    LINK_USB,
+    LINK_TCP,
+    LINK_EXT
+} link_t;
+static struct
+{
     link_t link;
-    int fd;                        // LINK_TCP
-    const smart_esp_link_t *ext;   // LINK_EXT (BLE, ...)
+    int fd;                      // LINK_TCP
+    const smart_esp_link_t *ext; // LINK_EXT (BLE, ...)
     int64_t since;
 } links[SMART_MAX_SESSIONS];
 
@@ -66,15 +78,18 @@ static int port_send(void *ctx, uint8_t session, const uint8_t *data, size_t len
     (void)ctx;
     if (session >= SMART_MAX_SESSIONS)
         return -1;
-    switch (links[session].link) {
+    switch (links[session].link)
+    {
     case LINK_USB:
         return usb_write(data, len);
-    case LINK_TCP: {
+    case LINK_TCP:
+    {
         size_t done = 0;
-        while (done < len) {
+        while (done < len)
+        {
             int n = send(links[session].fd, data + done, len - done, 0);
             if (n <= 0)
-                return -1;  // the reader task notices the dead socket and closes it
+                return -1; // the reader task notices the dead socket and closes it
             done += (size_t)n;
         }
         return 0;
@@ -112,7 +127,8 @@ static int port_store_write(void *ctx, const char *key, const void *data, size_t
 static void port_random(void *ctx, uint8_t *buf, size_t len)
 {
     (void)ctx;
-    if (rf_on) {
+    if (rf_on)
+    {
         esp_fill_random(buf, len);
         return;
     }
@@ -128,16 +144,78 @@ static void port_close(void *ctx, uint8_t session)
     (void)ctx;
     if (session >= SMART_MAX_SESSIONS)
         return;
-    if (links[session].link == LINK_TCP) {
+    if (links[session].link == LINK_TCP)
+    {
         close(links[session].fd);
         links[session].fd = -1;
-    } else if (links[session].link == LINK_EXT) {
+    }
+    else if (links[session].link == LINK_EXT)
+    {
         links[session].ext->close(links[session].ext->arg);
-    } else {
+    }
+    else
+    {
         return;
     }
     links[session].link = LINK_NONE;
 }
+
+// ---------- OTA: the core has checked signature, model and hash; we write ----------
+static int port_ota_begin(void *ctx, uint32_t total)
+{
+    (void)ctx;
+    ota_part = esp_ota_get_next_update_partition(NULL);
+    if (!ota_part || total > ota_part->size)
+    {
+        ESP_LOGE(TAG, "update of %lu bytes doesn't fit", (unsigned long)total);
+        return -1;
+    }
+    // erase as we go, not the whole slot up front: no long stall before the first chunk
+    esp_err_t err = esp_ota_begin(ota_part, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "can't start the update: %s", esp_err_to_name(err));
+        ota_handle = 0;
+        return -1;
+    }
+    ESP_LOGI(TAG, "receiving update: %lu bytes into %s", (unsigned long)total, ota_part->label);
+    return 0;
+}
+
+static int port_ota_write(void *ctx, uint32_t offset, const uint8_t *data, size_t len)
+{
+    (void)ctx;
+    (void)offset; // the core hands bytes over strictly in order
+    return ota_handle && esp_ota_write(ota_handle, data, len) == ESP_OK ? 0 : -1;
+}
+
+static int port_ota_finish(void *ctx, bool ok)
+{
+    (void)ctx;
+    if (!ota_handle)
+        return ok ? -1 : 0;
+    esp_ota_handle_t h = ota_handle;
+    ota_handle = 0;
+    if (!ok)
+    {
+        esp_ota_abort(h);
+        ESP_LOGW(TAG, "update aborted");
+        return 0;
+    }
+    esp_err_t err = esp_ota_end(h); // also checks the app image itself
+    if (err == ESP_OK)
+        err = esp_ota_set_boot_partition(ota_part);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "can't install the update: %s", esp_err_to_name(err));
+        return -1;
+    }
+    ESP_LOGI(TAG, "update installed in %s, rebooting into it", ota_part->label);
+    update_ready = true;
+    return 0;
+}
+
+bool smart_esp_update_ready(void) { return update_ready; }
 
 static const smart_port_t port = {
     .ctx = NULL,
@@ -147,6 +225,9 @@ static const smart_port_t port = {
     .store_write = port_store_write,
     .random = port_random,
     .close = port_close,
+    .ota_begin = port_ota_begin,
+    .ota_write = port_ota_write,
+    .ota_finish = port_ota_finish,
 };
 
 const smart_port_t *smart_esp_port(void) { return &port; }
@@ -159,7 +240,8 @@ void smart_esp_init(void)
     usb_tx_lock = xSemaphoreCreateMutex();
 
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
@@ -176,7 +258,8 @@ void smart_esp_erase(void)
 const char *smart_esp_device_id(void)
 {
     static char id[18];
-    if (!id[0]) {
+    if (!id[0])
+    {
         uint8_t mac[6];
         esp_read_mac(mac, ESP_MAC_WIFI_STA);
         snprintf(id, sizeof(id), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -201,7 +284,8 @@ static void usb_task(void *arg)
 {
     uint8_t session = (uint8_t)(uintptr_t)arg;
     uint8_t buf[64];
-    for (;;) {
+    for (;;)
+    {
         int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), portMAX_DELAY);
         if (n <= 0)
             continue;
@@ -217,15 +301,16 @@ void smart_esp_start_usb(void)
     cfg.tx_buffer_size = 1024;
     cfg.rx_buffer_size = 512;
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
-    usb_serial_jtag_vfs_use_driver();  // printf() goes through the driver too
+    usb_serial_jtag_vfs_use_driver(); // printf() goes through the driver too
     esp_log_set_vprintf(log_vprintf);
 
     smart_lock();
-    uint8_t s = smart_session_open(&g_smart, true);  // physical access = trusted
+    uint8_t s = smart_session_open(&g_smart, true); // physical access = trusted
     if (s != SMART_NO_SESSION)
         links[s].link = LINK_USB;
     smart_unlock();
-    if (s == SMART_NO_SESSION) {
+    if (s == SMART_NO_SESSION)
+    {
         ESP_LOGE(TAG, "no session left for USB");
         return;
     }
@@ -240,14 +325,16 @@ void smart_esp_start_usb(void)
 static uint8_t open_untrusted(void)
 {
     uint8_t s = smart_session_open(&g_smart, false);
-    if (s == SMART_NO_SESSION) {
+    if (s == SMART_NO_SESSION)
+    {
         int oldest = -1;
         for (int i = 0; i < SMART_MAX_SESSIONS; i++)
             if ((links[i].link == LINK_TCP || links[i].link == LINK_EXT) &&
                 !smart_session_authenticated(&g_smart, (uint8_t)i) &&
                 (oldest < 0 || links[i].since < links[oldest].since))
                 oldest = i;
-        if (oldest >= 0) {
+        if (oldest >= 0)
+        {
             ESP_LOGI(TAG, "dropping an unauthenticated connection to make room");
             smart_session_close(&g_smart, (uint8_t)oldest);
             port_close(NULL, (uint8_t)oldest);
@@ -263,7 +350,8 @@ uint8_t smart_esp_link_open(const smart_esp_link_t *link)
 {
     smart_lock();
     uint8_t s = open_untrusted();
-    if (s != SMART_NO_SESSION) {
+    if (s != SMART_NO_SESSION)
+    {
         links[s].link = LINK_EXT;
         links[s].ext = link;
     }
@@ -282,7 +370,8 @@ void smart_esp_link_feed(uint8_t s, const uint8_t *data, size_t len)
 void smart_esp_link_gone(uint8_t s)
 {
     smart_lock();
-    if (s < SMART_MAX_SESSIONS && links[s].link == LINK_EXT) {
+    if (s < SMART_MAX_SESSIONS && links[s].link == LINK_EXT)
+    {
         smart_session_close(&g_smart, s);
         links[s].link = LINK_NONE;
     }
@@ -309,7 +398,7 @@ static void tcp_accept(int lfd)
         return;
 
     int one = 1, idle = 30, intvl = 5, cnt = 3;
-    struct timeval tmo = { .tv_sec = 0, .tv_usec = 300000 };
+    struct timeval tmo = {.tv_sec = 0, .tv_usec = 300000};
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     // a host that vanished without closing (power cut) is noticed in ~45 s
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
@@ -321,7 +410,8 @@ static void tcp_accept(int lfd)
 
     smart_lock();
     uint8_t s = open_untrusted();
-    if (s != SMART_NO_SESSION) {
+    if (s != SMART_NO_SESSION)
+    {
         links[s].link = LINK_TCP;
         links[s].fd = fd;
     }
@@ -333,27 +423,31 @@ static void tcp_accept(int lfd)
 static void tcp_task(void *arg)
 {
     uint16_t port = (uint16_t)(uintptr_t)arg;
-    int lfd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);  // dual-stack: IPv4 too
+    int lfd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP); // dual-stack: IPv4 too
     int one = 1;
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in6 addr = { .sin6_family = AF_INET6, .sin6_port = htons(port) };
-    if (lfd < 0 || bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) || listen(lfd, 2)) {
+    struct sockaddr_in6 addr = {.sin6_family = AF_INET6, .sin6_port = htons(port)};
+    if (lfd < 0 || bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) || listen(lfd, 2))
+    {
         ESP_LOGE(TAG, "TCP server failed: errno %d", errno);
         vTaskDelete(NULL);
         return;
     }
     ESP_LOGI(TAG, "listening on TCP %u", port);
 
-    for (;;) {
+    for (;;)
+    {
         fd_set rd;
         FD_ZERO(&rd);
         FD_SET(lfd, &rd);
         int maxfd = lfd;
         int fds[SMART_MAX_SESSIONS];
         smart_lock();
-        for (int i = 0; i < SMART_MAX_SESSIONS; i++) {
+        for (int i = 0; i < SMART_MAX_SESSIONS; i++)
+        {
             fds[i] = links[i].link == LINK_TCP ? links[i].fd : -1;
-            if (fds[i] >= 0) {
+            if (fds[i] >= 0)
+            {
                 FD_SET(fds[i], &rd);
                 if (fds[i] > maxfd)
                     maxfd = fds[i];
@@ -361,24 +455,26 @@ static void tcp_task(void *arg)
         }
         smart_unlock();
 
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
         if (select(maxfd + 1, &rd, NULL, NULL, &tv) <= 0)
             continue;
 
         // Read first, accept last: a socket the core closes meanwhile may hand
         // its number to the next accept(), which must not happen inside this loop.
-        for (int i = 0; i < SMART_MAX_SESSIONS; i++) {
+        for (int i = 0; i < SMART_MAX_SESSIONS; i++)
+        {
             if (fds[i] < 0 || !FD_ISSET(fds[i], &rd))
                 continue;
             uint8_t buf[256];
             int n = recv(fds[i], buf, sizeof(buf), 0);
-            if (n <= 0) {
+            if (n <= 0)
+            {
                 if (links[i].link == LINK_TCP && links[i].fd == fds[i])
                     tcp_close_session((uint8_t)i);
                 continue;
             }
             smart_lock();
-            if (links[i].link == LINK_TCP && links[i].fd == fds[i])  // not replaced meanwhile
+            if (links[i].link == LINK_TCP && links[i].fd == fds[i]) // not replaced meanwhile
                 smart_session_feed(&g_smart, (uint8_t)i, buf, (size_t)n);
             smart_unlock();
         }

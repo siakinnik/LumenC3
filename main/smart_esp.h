@@ -6,6 +6,7 @@
 // Moves to the smart-esp-device template once a second device uses it.
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -50,6 +51,10 @@ void smart_esp_link_gone(uint8_t session);
 // Tell the port the radio is running: from now on esp_fill_random() is a
 // true RNG and needs no help from the bootloader's entropy source.
 void smart_esp_rf_started(void);
+
+// A signed update was received and set as the next boot image: reboot (once
+// the ACK has left).
+bool smart_esp_update_ready(void);
 
 // "AA:BB:CC:DD:EE:FF" of the Wi-Fi station interface.
 const char *smart_esp_device_id(void);
