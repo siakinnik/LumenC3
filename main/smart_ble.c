@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_wifi.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
@@ -189,6 +190,9 @@ static void host_task(void *param)
 void smart_ble_init(const char *device_name)
 {
     strncpy(name, device_name, sizeof(name) - 1);
+    // Wi-Fi runs without modem sleep (smart_wifi_start); coexistence with
+    // BLE needs it, so turn it back on until the next reboot.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
     ESP_ERROR_CHECK(nimble_port_init());
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;

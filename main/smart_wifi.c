@@ -30,6 +30,10 @@ static esp_netif_t *netif;
 static bool mdns_up;
 static esp_timer_handle_t retry_timer;
 static uint32_t backoff_ms = 1000;
+// Password-class failures in a row. A handshake timeout also happens with a
+// right password (first try after boot, a busy router), so one alone isn't
+// reported: hosts setting up Wi-Fi take wrong_password as final.
+static uint8_t auth_failures;
 
 static void set_state(uint8_t state, const char *addr, uint8_t error)
 {
@@ -91,7 +95,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         }
         wifi_event_sta_disconnected_t *ev = data;
         ESP_LOGW(TAG, "disconnected (reason %d), retry in %lu ms", ev->reason, (unsigned long)backoff_ms);
-        set_state(ST_CONNECTING, "", error_for(ev->reason));
+        uint8_t error = error_for(ev->reason);
+        if (error == ERR_WRONG_PASSWORD && ++auth_failures < 2)
+            error = ERR_NONE;
+        set_state(ST_CONNECTING, "", error);
         schedule_connect(backoff_ms);
         backoff_ms = backoff_ms * 2 > 30000 ? 30000 : backoff_ms * 2;
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -100,6 +107,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         snprintf(addr, sizeof(addr), IPSTR, IP2STR(&ev->ip_info.ip));
         ESP_LOGI(TAG, "connected: %s", addr);
         backoff_ms = 1000;
+        auth_failures = 0;
         set_state(ST_CONNECTED, addr, ERR_NONE);
     }
 }
@@ -119,6 +127,7 @@ static void apply(void)
     esp_wifi_disconnect();
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     backoff_ms = 1000;
+    auth_failures = 0;
 
     if (!cfg.sta.ssid[0]) {
         ESP_LOGI(TAG, "no network configured; set sys.wifi_ssid over USB");
@@ -196,19 +205,24 @@ void smart_wifi_start(const char *hostname_prefix, uint16_t tcp_port, uint16_t m
     ESP_ERROR_CHECK(esp_timer_create(&targs, &retry_timer));
 
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Mains powered: no modem sleep. With it the strip answered pings in
+    // up to 4 s and lost the router's beacons. BLE needs it back on
+    // (smart_ble_init), since Wi-Fi/BLE coexistence requires modem sleep.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     smart_esp_rf_started();
     apply();
 
     // mDNS: hosts find the device as _smart._tcp, see PROTOCOL.md (Discovery)
-    static char model_id_str[8];
+    static char model_id_str[8], proto_str[4];
     snprintf(model_id_str, sizeof(model_id_str), "%u", model_id);
+    snprintf(proto_str, sizeof(proto_str), "%d", SMART_PROTO_VERSION);
     if (mdns_init() == ESP_OK) {
         mdns_hostname_set(hostname);
         mdns_txt_item_t txt[] = {
             { "id", smart_esp_device_id() },
             { "model", model },
             { "model_id", model_id_str },
-            { "proto", "1" },
+            { "proto", proto_str },
         };
         mdns_service_add(hostname, "_smart", "_tcp", tcp_port, txt, sizeof(txt) / sizeof(txt[0]));
         mdns_up = true;

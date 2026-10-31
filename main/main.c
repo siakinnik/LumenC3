@@ -39,6 +39,10 @@ static volatile uint32_t show_since;
 static uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 static bool ble_up;  // the BLE stack is only brought up for a pairing window
+// The boot pairing window is over: restart without BLE. Its coexistence with
+// Wi-Fi needs modem sleep, which made the network link unusable (up to 4 s
+// pings, lost beacons); a plain boot runs Wi-Fi without it.
+static volatile bool ble_done;
 
 #ifdef OTA_SIGNING_KEY
 static const uint8_t ota_key[32] = OTA_SIGNING_KEY;
@@ -56,10 +60,12 @@ static void on_pairing(smart_core_t *core, smart_pairing_event_t ev, void *user)
         bool open = ev == SMART_PAIRING_OPENED;
         smart_wifi_set_pairing(open);
         if (ble_up) {
-            if (open)
+            if (open) {
                 smart_ble_start();
-            else
+            } else {
                 smart_ble_stop();
+                ble_done = true;
+            }
         }
     }
     show_since = now_ms();
@@ -274,6 +280,10 @@ void app_main(void)
         if (smart_esp_update_ready())
             restart(false);
         uint32_t now = now_ms();
+        if (ble_done && now - show_since >= 3000) {  // after the pairing indication
+            ESP_LOGI(TAG, "pairing mode over: restarting without BLE");
+            restart(false);
+        }
         if (on_trial && now >= UPDATE_TRIAL_MS) {
             esp_ota_mark_app_valid_cancel_rollback();
             ESP_LOGI(TAG, "new firmware kept");
